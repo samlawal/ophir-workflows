@@ -1,0 +1,45 @@
+# Ophir-standard reusable CI gate for Node/Next client sites.
+#
+# It runs the repo's own `ci` script (typecheck + vitest, including any
+# real-Postgres pglite integration tests). This is the single source of truth
+# for the fleet's CI — sites reference it instead of each carrying a copy that
+# drifts. The BINDING stop that blocks a red deploy lives in each site's
+# vercel.json (`buildCommand: npm run ci && npm run build`); this workflow is the
+# visible check and the PR gate.
+#
+# Requirements in the caller repo:
+#   • package.json has a `ci` script, e.g. "ci": "npm run typecheck && npm run test"
+#   • committed package-lock.json (for `npm ci`)
+#   • the suite is hermetic (pin NODE_ENV=test etc. in vitest.config) so it
+#     passes identically in CI and inside the Vercel build.
+#
+# Usage (caller: .github/workflows/ci.yml):
+#   name: CI
+#   on: { push: { branches: [main, staging] }, pull_request: {} }
+#   jobs:
+#     verify:
+#       uses: samlawal/ophir-workflows/.github/workflows/ci-node.yml@main
+name: Node CI (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version to run the gate on.
+        type: string
+        default: "20"
+        required: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+      - run: npm ci
+      # typecheck + vitest (unit + pglite real-SQL integration). Env-free:
+      # pglite is in-process, no DATABASE_URL needed.
+      - run: npm run ci
