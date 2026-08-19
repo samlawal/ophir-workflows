@@ -1,4 +1,4 @@
-# Ophir-standard reusable CI gate for Node/Next client sites.
+# Reusable CI gate for Node/Next projects.
 #
 # It runs the repo's own `ci` script (typecheck + vitest, including any
 # real-Postgres pglite integration tests). This is the single source of truth
