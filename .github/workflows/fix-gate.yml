@@ -1,0 +1,124 @@
+# Reusable FIX GATE — the deterministic check on a `fix/<bug-id>` branch.
+#
+# No AI in here. It decides from facts:
+#   1. which files the branch changed vs the base branch, classified against the
+#      caller repo's own `.ophir/protected.json` (forbidden / protected / low);
+#   2. whether the caller's full `ci` script passes on that branch;
+# then sends a SIGNED verdict to the pipeline owner and fails the run if the
+# branch touched a forbidden file or the suite is red.
+#
+# Requirements in the caller repo:
+#   • `.ophir/protected.json` (without it every change counts as "protected")
+#   • a `ci` script and a committed package-lock.json (as for ci-node.yml)
+#   • optional secret OPHIR_PIPELINE_SECRET; without it the verdict is shown in
+#     the run summary but not reported.
+#
+# Usage (caller: .github/workflows/fix-gate.yml):
+#   name: Fix gate
+#   on: { push: { branches: ['fix/**'] } }
+#   jobs:
+#     gate:
+#       uses: samlawal/ophir-workflows/.github/workflows/fix-gate.yml@main
+#       secrets:
+#         OPHIR_PIPELINE_SECRET: ${{ secrets.OPHIR_PIPELINE_SECRET }}
+name: Fix gate (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: "20"
+        required: false
+      base-branch:
+        description: Branch the fix will merge into.
+        type: string
+        default: main
+        required: false
+      report-url:
+        type: string
+        default: https://ophirdigital.com/api/pipeline/report
+        required: false
+      gate-ref:
+        description: Ref of this repo to take the gate scripts from.
+        type: string
+        default: main
+        required: false
+    secrets:
+      OPHIR_PIPELINE_SECRET:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The gate scripts go to the runner's temp dir, NOT the workspace — inside
+      # the workspace the caller's own test runner would pick up our tests.
+      - name: Fetch the gate scripts
+        run: |
+          mkdir -p "$RUNNER_TEMP/gate"
+          for f in classify.mjs report.mjs; do
+            curl -fsSL "https://raw.githubusercontent.com/samlawal/ophir-workflows/${{ inputs.gate-ref }}/scripts/fix-gate/$f" -o "$RUNNER_TEMP/gate/$f"
+          done
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Classify the changed files
+        id: classify
+        run: |
+          git fetch --no-tags origin "${{ inputs.base-branch }}"
+          git diff --name-only "origin/${{ inputs.base-branch }}...HEAD" > "$RUNNER_TEMP/changed.txt"
+          node "$RUNNER_TEMP/gate/classify.mjs" .ophir/protected.json "$RUNNER_TEMP/changed.txt" > "$RUNNER_TEMP/gate.json"
+          echo "risk=$(node -p "require('$RUNNER_TEMP/gate.json').risk")" >> "$GITHUB_OUTPUT"
+
+      - run: npm ci
+
+      - name: Full suite
+        id: ci
+        continue-on-error: true
+        run: npm run ci
+
+      - name: Summary
+        if: always()
+        env:
+          CI_OUTCOME: ${{ steps.ci.outcome }}
+        run: |
+          node -e '
+            const g = require(process.env.RUNNER_TEMP + "/gate.json");
+            const rows = (a, f) => a.length ? a.map(f).join("\n") : "_none_";
+            console.log(`## Fix gate\n\n**Risk:** \`${g.risk}\` · **Suite:** \`${process.env.CI_OUTCOME}\`\n\n${g.reason}\n`);
+            console.log(`### Changed files\n${rows(g.changedFiles, f => "- `" + f + "`")}\n`);
+            console.log(`### Tests in this change\n${rows(g.testFiles, f => "- `" + f + "`")}\n`);
+            console.log(`### Protected hits\n${rows(g.protectedHits, h => "- `" + h.file + "` (" + h.area + ")")}\n`);
+            console.log(`### Forbidden hits\n${rows(g.forbiddenHits, h => "- `" + h.file + "`")}`);
+          ' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report to Ophir (signed)
+        if: always()
+        env:
+          OPHIR_PIPELINE_SECRET: ${{ secrets.OPHIR_PIPELINE_SECRET }}
+          OPHIR_REPORT_URL: ${{ inputs.report-url }}
+          CI_OUTCOME: ${{ steps.ci.outcome }}
+        run: node "$RUNNER_TEMP/gate/report.mjs" "$RUNNER_TEMP/gate.json"
+
+      - name: Verdict
+        run: |
+          if [ "${{ steps.classify.outputs.risk }}" = "forbidden" ]; then
+            echo "::error::This fix branch changed a forbidden file. See the summary."
+            exit 1
+          fi
+          if [ "${{ steps.ci.outcome }}" != "success" ]; then
+            echo "::error::The full suite failed on this branch."
+            exit 1
+          fi
+          echo "Gate passed: risk=${{ steps.classify.outputs.risk }}"
